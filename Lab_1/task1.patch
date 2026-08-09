@@ -1,0 +1,86 @@
+diff --git a/Makefile b/Makefile
+index dde08b1..8e80d85 100644
+--- a/Makefile
++++ b/Makefile
+@@ -126,6 +126,7 @@ mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
+ UPROGS=\
+ 	$U/_cat\
+ 	$U/_echo\
++	$U/_primepidtest\
+ 	$U/_forktest\
+ 	$U/_grep\
+ 	$U/_init\
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22a5401..6439e60 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -12,6 +12,7 @@ struct proc proc[NPROC];
+ 
+ struct proc *initproc;
+ 
++int primes[1000];
+ int nextpid = 1;
+ struct spinlock pid_lock;
+ 
+@@ -89,14 +90,35 @@ myproc(void)
+   return p;
+ }
+ 
++int isprime(int x){
++  if(x==1) return 1;
++  for(int i =2;i*i<=x;i++){
++    if(x%i==0){
++      return 0;
++    }
++  }
++  return 1;
++}
++
+ int
+ allocpid()
+ {
+-  int pid;
++  int pid=1;
+   
+   acquire(&pid_lock);
+-  pid = nextpid;
+-  nextpid = nextpid + 1;
++  if(nextpid==1 || nextpid==2 ||nextpid==3){
++    pid = 8*nextpid;
++  }
++  else{
++    for(int i = 2;i<1000;i++){
++      if(isprime(i)==1 && primes[i]==0){
++        primes[i] = 1;
++        pid = i;
++        break;
++      }
++    }
++  }
++  nextpid++;
+   release(&pid_lock);
+ 
+   return pid;
+diff --git a/user/primepidtest.c b/user/primepidtest.c
+new file mode 100644
+index 0000000..f3b892d
+--- /dev/null
++++ b/user/primepidtest.c
+@@ -0,0 +1,16 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int main() {
++  for (int i = 0; i < 5; i++) {
++    int pid = fork();
++    if (pid == 0) {
++      printf("Child %d: PID = %d\n", i + 1, getpid());
++      exit(0);
++    } else {
++      wait(0);  // wait for child to finish before next fork
++    }
++  }
++
++  exit(0);
++}
+\ No newline at end of file
