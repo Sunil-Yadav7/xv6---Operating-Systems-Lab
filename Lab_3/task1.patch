@@ -1,0 +1,622 @@
+diff --git a/kernel/Shmmbox_test.c b/kernel/Shmmbox_test.c
+new file mode 100644
+index 0000000..1549da2
+--- /dev/null
++++ b/kernel/Shmmbox_test.c
+@@ -0,0 +1,44 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int
++main(void)
++{
++  // SHM test
++  int id = shm_create(42);
++  if(id < 0){ printf("shm_create fail\n"); exit(1); }
++  uchar *p = (uchar*)shm_get(42);
++  if(!p){ printf("shm_get fail\n"); exit(1); }
++  p[0] = 77;
++
++  int pid = fork();
++  if(pid == 0){
++    uchar *q = (uchar*)shm_get(42);
++    printf("child sees %d\n", q[0]);  // expect 77
++    q[0] = 99;
++    shm_close(42);
++    exit(0);
++  }
++  wait(0);
++  printf("parent now sees %d\n", p[0]); // expect 99
++  shm_close(42);
++
++  // MBOX test
++  int mid = mbox_create(7);
++  if(mid < 0){ printf("mbox_create fail\n"); exit(1); }
++  int c = fork();
++  if(c == 0){
++    int v;
++    for(int i=0;i<5;i++){
++      mbox_recv(mid, &v);
++      printf("child got %d\n", v);
++    }
++    exit(0);
++  } else {
++    for(int i=0;i<5;i++){
++      mbox_send(mid, 100+i);
++    }
++    wait(0);
++  }
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 122d9ca..09d9024 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -181,5 +181,19 @@ void            virtio_disk_init(void);
+ void            virtio_disk_rw(struct buf *, int);
+ void            virtio_disk_intr(void);
+ 
++// task 1
++// shared memory
++int       shm_create_k(int key);
++uint64    shm_get_k(int key);
++int       shm_close_k(int key);
++
++// mailboxes
++int       mbox_create_k(int key);
++int       mbox_send_k(int id, int msg);
++int       mbox_recv_k(int id, int *out);
++
++void shm_on_exit_all(struct proc *p);
++void shm_on_exec_all(pagetable_t old, struct proc *p);
++
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/kernel/mbox.c b/kernel/mbox.c
+new file mode 100644
+index 0000000..d6a8593
+--- /dev/null
++++ b/kernel/mbox.c
+@@ -0,0 +1,111 @@
++#include "types.h"
++#include "param.h"
++#include "spinlock.h"
++#include "riscv.h"
++#include "proc.h"
++#include "defs.h"
++
++#define NMB 16        // Maximum number of mailboxes
++#define MBOX_CAP 32   // Capacity of each mailbox buffer
++
++struct mbox {
++  int used;
++  int key;
++  int id;              // index in table
++  struct spinlock lock;
++  int buf[MBOX_CAP];
++  int head, tail, cnt; // circular queue
++};
++
++static struct {
++  struct spinlock lock;
++  struct mbox box[NMB];
++  int inited;
++} mbs;
++
++static void
++mb_init(void)
++{
++  if(!mbs.inited){
++    initlock(&mbs.lock, "mb_tbl");
++    for(int i=0; i<NMB; i++){
++      mbs.box[i].used = 0;
++      initlock(&mbs.box[i].lock, "mb");
++    }
++    mbs.inited = 1;
++  }
++}
++
++static int
++find_mbox_by_key(int key)
++{
++  for(int i=0; i<NMB; i++)
++    if(mbs.box[i].used && mbs.box[i].key==key) return i;
++  return -1;
++}
++
++static int
++find_mbox_free(void)
++{
++  for(int i=0; i<NMB; i++)
++    if(!mbs.box[i].used) return i;
++  return -1;
++}
++
++int
++mbox_create_k(int key)
++{
++  mb_init();
++  acquire(&mbs.lock);
++  int idx = find_mbox_by_key(key);
++  if(idx >= 0){ release(&mbs.lock); return idx; }
++  idx = find_mbox_free();
++  if(idx < 0){ release(&mbs.lock); return -1; }
++
++  struct mbox *m = &mbs.box[idx];
++  m->used = 1;
++  m->key = key;
++  m->id = idx;
++  m->head = m->tail = m->cnt = 0;
++  release(&mbs.lock);
++  return idx;
++}
++
++int
++mbox_send_k(int id, int msg)
++{
++  if(id < 0 || id >= NMB) return -1;
++  struct mbox *m = &mbs.box[id];
++  if(!m->used) return -1;
++
++  acquire(&m->lock);
++  while(m->cnt == MBOX_CAP)
++    sleep(m, &m->lock);        // wait for space
++  m->buf[m->tail] = msg;
++  m->tail = (m->tail + 1) % MBOX_CAP;
++  m->cnt++;
++  wakeup(m);                   // wake one+ receivers
++  release(&m->lock);
++  return 0;
++}
++
++int
++mbox_recv_k(int id, int *out)
++{
++  if(id < 0 || id >= NMB) return -1;
++  struct mbox *m = &mbs.box[id];
++  if(!m->used) return -1;
++
++  acquire(&m->lock);
++  while(m->cnt == 0)
++    sleep(m, &m->lock);        // wait for data
++  int v = m->buf[m->head];
++  m->head = (m->head + 1) % MBOX_CAP;
++  m->cnt--;
++  wakeup(m);                   // wake one+ senders
++  release(&m->lock);
++
++  *out = v;
++  return 0;
++}
++
+diff --git a/kernel/mbox_ping.c b/kernel/mbox_ping.c
+new file mode 100644
+index 0000000..be78918
+--- /dev/null
++++ b/kernel/mbox_ping.c
+@@ -0,0 +1,30 @@
++// user/mbox_ping.c
++#include "kernel/types.h"
++#include "user/user.h"
++
++int
++main(void)
++{
++  int a2b = mbox_create(100);
++  int b2a = mbox_create(101);
++
++  int pid = fork();
++  if(pid == 0){
++    // B
++    for(int i=0;i<3;i++){
++      int v; mbox_recv(a2b, &v);
++      mbox_send(b2a, v+1);
++    }
++    exit(0);
++  } else if(pid > 0){
++    // A
++    for(int i=0;i<3;i++){
++      mbox_send(a2b, i);
++      int v; mbox_recv(b2a, &v);
++      printf("ping %d -> pong %d\n", i, v);
++    }
++    wait(0);
++    exit(0);
++  }
++  exit(1);
++}
+\ No newline at end of file
+diff --git a/kernel/param.h b/kernel/param.h
+index cd2a41c..37fa595 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -12,4 +12,7 @@
+ #define FSSIZE       2000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name
+ #define USERSTACK    1     // user stack pages
+-
++// IPC limits
++#define NSHM         32      // max shared-memory regions
++#define NMB          32      // max mailboxes
++#define MBOX_CAP     16      // ints per mailbox
+diff --git a/kernel/shm.c b/kernel/shm.c
+new file mode 100644
+index 0000000..2bede38
+--- /dev/null
++++ b/kernel/shm.c
+@@ -0,0 +1,232 @@
++// kernel/shm.c
++#include "types.h"
++#include "param.h"
++#include "spinlock.h"
++#include "riscv.h"
++#include "memlayout.h"
++#include "proc.h"
++#include "defs.h"
++
++struct shm_region {
++  int used;
++  int key;
++  char *pa;          // physical page
++  int refcnt;        // # attached processes
++};
++
++// Global SHM table
++static struct {
++  struct spinlock lock;
++  struct shm_region reg[NSHM];
++  int inited;
++} shm;
++
++// Map each slot i to a high VA window below TRAPFRAME.
++// (Fixed VA per slot across all processes.)
++static inline uint64
++slot_va(int idx)
++{
++  return TRAPFRAME - ((uint64)(idx + 1) * PGSIZE);
++}
++
++static inline int
++mapped_at(pagetable_t pt, uint64 va)
++{
++  return walkaddr(pt, va) != 0;
++}
++
++static void
++shm_init(void)
++{
++  if(!shm.inited){
++    initlock(&shm.lock, "shm_tbl");
++    for(int i=0;i<NSHM;i++){
++      shm.reg[i].used = 0;
++      shm.reg[i].key = 0;
++      shm.reg[i].pa = 0;
++      shm.reg[i].refcnt = 0;
++    }
++    shm.inited = 1;
++  }
++}
++
++// find slot by key; return index or -1
++static int
++find_slot_nolock(int key)
++{
++  for(int i=0;i<NSHM;i++)
++    if(shm.reg[i].used && shm.reg[i].key == key)
++      return i;
++  return -1;
++}
++
++// find free slot; return index or -1
++static int
++find_free_nolock(void)
++{
++  for(int i=0;i<NSHM;i++)
++    if(!shm.reg[i].used)
++      return i;
++  return -1;
++}
++
++int
++shm_create_k(int key)
++{
++  shm_init();
++  acquire(&shm.lock);
++  int idx = find_slot_nolock(key);
++  if(idx >= 0){
++    release(&shm.lock);
++    return idx; // already exists
++  }
++  idx = find_free_nolock();
++  if(idx < 0){
++    release(&shm.lock);
++    return -1;
++  }
++
++  char *pa = kalloc();
++  if(pa == 0){
++    release(&shm.lock);
++    return -1;
++  }
++  memset(pa, 0, PGSIZE);
++
++  shm.reg[idx].used   = 1;
++  shm.reg[idx].key    = key;
++  shm.reg[idx].pa     = pa;
++  shm.reg[idx].refcnt = 0;
++
++  release(&shm.lock);
++  return idx;
++}
++
++// Returns VA on success, 0 on failure.
++uint64
++shm_get_k(int key)
++{
++  shm_init();
++  struct proc *p = myproc();
++
++  acquire(&shm.lock);
++  int idx = find_slot_nolock(key);
++  if(idx < 0){
++    release(&shm.lock);
++    return 0; // region not created
++  }
++  uint64 va = slot_va(idx);
++  // Fast path: already mapped for this proc.
++  if(mapped_at(p->pagetable, va)){
++    release(&shm.lock);
++    return va;
++  }
++
++  // Map and bump refcnt atomically under the table lock to avoid
++  // transient negative/over/under counts on concurrent attachers.
++  if(mappages(p->pagetable, va, PGSIZE, (uint64)shm.reg[idx].pa, PTE_U|PTE_R|PTE_W) < 0){
++    release(&shm.lock);
++    return 0;
++  }
++  shm.reg[idx].refcnt++;
++  release(&shm.lock);
++  return va;
++}
++
++int
++shm_close_k(int key)
++{
++  shm_init();
++  struct proc *p = myproc();
++
++  acquire(&shm.lock);
++  int idx = find_slot_nolock(key);
++  if(idx < 0){
++    release(&shm.lock);
++    return -1;
++  }
++  uint64 va = slot_va(idx);
++
++  // Only detach/count-down if this proc actually had it mapped.
++  int was_mapped = mapped_at(p->pagetable, va);
++  release(&shm.lock);
++
++  if(was_mapped){
++    // Unmap outside the shm.lock; do_free=0 since it's shared.
++    uvmunmap(p->pagetable, va, 1, 0);
++
++    // Now adjust refcount and possibly free the region.
++    acquire(&shm.lock);
++    if(shm.reg[idx].refcnt > 0)
++      shm.reg[idx].refcnt--;
++    int freeit = (shm.reg[idx].refcnt == 0 && shm.reg[idx].pa != 0);
++    char *pa = shm.reg[idx].pa;
++    if(freeit){
++      shm.reg[idx].used = 0;
++      shm.reg[idx].key = 0;
++      shm.reg[idx].pa = 0;
++    }
++    release(&shm.lock);
++    if(freeit)
++      kfree(pa);
++  }
++  return 0;
++}
++
++// Detach all SHM mappings from p's CURRENT pagetable (called in exit()).
++void
++shm_on_exit_all(struct proc *p)
++{
++  shm_init();
++  if(p == 0 || p->pagetable == 0) return;
++
++  for(int i=0;i<NSHM;i++){
++    uint64 va = slot_va(i);
++    if(mapped_at(p->pagetable, va)){
++      uvmunmap(p->pagetable, va, 1, 0); // shared: do_free=0
++
++      acquire(&shm.lock);
++      if(shm.reg[i].refcnt > 0)
++        shm.reg[i].refcnt--;
++      int freeit = (shm.reg[i].refcnt == 0 && shm.reg[i].pa != 0);
++      char *pa = shm.reg[i].pa;
++      if(freeit){
++        shm.reg[i].used = 0;
++        shm.reg[i].key = 0;
++        shm.reg[i].pa = 0;
++      }
++      release(&shm.lock);
++      if(freeit)
++        kfree(pa);
++    }
++  }
++}
++
++// Detach from the OLD pagetable during exec() (before freeing it).
++void
++shm_on_exec_all(pagetable_t old, struct proc *p)
++{
++  shm_init();
++  if(old == 0) return;
++
++  for(int i=0;i<NSHM;i++){
++    uint64 va = slot_va(i);
++    if(mapped_at(old, va)){
++      uvmunmap(old, va, 1, 0);t 
++
++      acquire(&shm.lock);
++      if(shm.reg[i].refcnt > 0)
++        shm.reg[i].refcnt--;
++      int freeit = (shm.reg[i].refcnt == 0 && shm.reg[i].pa != 0);
++      char *pa = shm.reg[i].pa;
++      if(freeit){
++        shm.reg[i].used = 0;
++        shm.reg[i].key = 0;
++        shm.reg[i].pa = 0;
++      }
++      release(&shm.lock);
++      if(freeit)
++        kfree(pa);
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..9974783 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,7 +101,12 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+-
++extern uint64 sys_shm_create(void);
++extern uint64 sys_shm_get(void);
++extern uint64 sys_shm_close(void);
++extern uint64 sys_mbox_create(void);
++extern uint64 sys_mbox_send(void);
++extern uint64 sys_mbox_recv(void);
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+ static uint64 (*syscalls[])(void) = {
+@@ -126,6 +131,12 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_shm_create]   sys_shm_create,
++[SYS_shm_get]      sys_shm_get,
++[SYS_shm_close]    sys_shm_close,
++[SYS_mbox_create]  sys_mbox_create,
++[SYS_mbox_send]    sys_mbox_send,
++[SYS_mbox_recv]    sys_mbox_recv,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..0811086 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,10 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++// add near the end, keep unique numbers
++#define SYS_shm_create   29
++#define SYS_shm_get      30
++#define SYS_shm_close    31
++#define SYS_mbox_create  32
++#define SYS_mbox_send    33
++#define SYS_mbox_recv    34
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 419e727..8b5ef29 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -107,3 +107,55 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++//changes for task 1
++
++uint64
++sys_shm_create(void)
++{
++  int key; argint(0, &key);
++  return shm_create_k(key);
++}
++
++uint64
++sys_shm_get(void)
++{
++  int key; argint(0, &key);
++  return shm_get_k(key);       // returns VA (0 on error)
++}
++
++uint64
++sys_shm_close(void)
++{
++  int key; argint(0, &key);
++  return shm_close_k(key);
++}
++
++uint64
++sys_mbox_create(void)
++{
++  int key; argint(0, &key);
++  return mbox_create_k(key);
++}
++
++uint64
++sys_mbox_send(void)
++{
++  int id, msg;
++  argint(0, &id);
++  argint(1, &msg);
++  return mbox_send_k(id, msg);
++}
++
++uint64
++sys_mbox_recv(void)
++{
++  int id; uint64 uptr;
++  argint(0, &id);
++  argaddr(1, &uptr);
++  int v;
++  int r = mbox_recv_k(id, &v);   // may block
++  if(r < 0) return -1;
++  if(copyout(myproc()->pagetable, uptr, (char*)&v, sizeof(v)) < 0) return -1;
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index ac84de9..eadafb7 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -25,6 +25,13 @@ char* sys_sbrk(int,int);
+ int pause(int);
+ int uptime(void);
+ 
++int    shm_create(int key);
++void* shm_get(int key);
++int    shm_close(int key);
++
++int    mbox_create(int key);
++int    mbox_send(int id, int msg);
++int    mbox_recv(int id, int *msg);
+ // ulib.c
+ int stat(const char*, struct stat*);
+ char* strcpy(char*, const char*);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..cf62e40 100644
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,9 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("shm_create");
++entry("shm_get");
++entry("shm_close");
++entry("mbox_create");
++entry("mbox_send");
++entry("mbox_recv");
+\ No newline at end of file
