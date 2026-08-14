@@ -1,0 +1,871 @@
+diff --git a/kernel/mru.c b/kernel/mru.c
+new file mode 100644
+index 0000000..79092fb
+--- /dev/null
++++ b/kernel/mru.c
+@@ -0,0 +1,206 @@
++// kernel/mru.c
++#include "types.h"
++#include "spinlock.h"
++#include "param.h"
++#include "proc.h"
++#include "riscv.h"
++#include "defs.h"
++#include "paging.h"
++
++#define MRU_DUMP_MAX 32
++
++static struct {
++    struct spinlock lock;
++    struct mru_node *head; // Most-recent page at head. MRU policy: evict head first.
++} mru;
++
++void
++mru_init(void)
++{
++    initlock(&mru.lock, "mru");
++    mru.head = 0;
++}
++
++// -------- internal helpers (require mru.lock) --------
++
++static inline void
++unlink(struct mru_node *n)
++{
++    if (n->prev) n->prev->next = n->next; else mru.head = n->next;
++    if (n->next) n->next->prev = n->prev;
++    n->prev = n->next = 0;
++}
++
++static inline void
++link_front(struct mru_node *n)
++{
++    n->prev = 0;
++    n->next = mru.head;
++    if (mru.head) mru.head->prev = n;
++    mru.head = n;
++}
++
++// find expects page-aligned VA; lock must be held
++static inline struct mru_node*
++find_aligned_locked(struct proc *p, uint64 va_aligned)
++{
++    for (struct mru_node *n = mru.head; n; n = n->next)
++        if (n->p == p && n->va == va_aligned)
++            return n;
++    return 0;
++}
++
++void
++mru_on_map(struct proc *p, uint64 va)
++{
++    va = PGROUNDDOWN(va);
++    
++    // Optimistically allocate outside the lock (best-effort)
++    struct mru_node *m = (struct mru_node*)kalloc();
++    if (m) { m->p = p; m->va = va; m->prev = m->next = 0; }
++
++    acquire(&mru.lock);
++    
++    // Re-check under the lock to avoid duplicates from races
++    struct mru_node *existing = find_aligned_locked(p, va);
++    if (existing) {
++        if (existing != mru.head) { unlink(existing); link_front(existing); }
++        release(&mru.lock);
++        if (m) kfree((void*)m); // didn't need the fresh node
++        return;
++    }
++
++    // No existing node: insert if we managed to allocate one
++    if (m) {
++        link_front(m);
++        m = 0; // consumed
++    }
++    release(&mru.lock);
++
++    if (m) kfree((void*)m);
++}
++
++void
++mru_touch(struct proc *p, uint64 va)
++{
++    va = PGROUNDDOWN(va);
++    acquire(&mru.lock);
++    struct mru_node *n = find_aligned_locked(p, va);
++    if (n && n != mru.head) { unlink(n); link_front(n); }
++    release(&mru.lock);
++}
++
++void
++mru_on_unmap(struct proc *p, uint64 va)
++{
++    va = PGROUNDDOWN(va);
++    acquire(&mru.lock);
++    for (struct mru_node *n = mru.head, *next; n; n = next) {
++        next = n->next;
++        if (n->p == p && n->va == va) {
++            unlink(n);
++            kfree((void*)n);
++        }
++    }
++    release(&mru.lock);
++}
++
++void
++mru_purge_proc(struct proc *p)
++{
++    acquire(&mru.lock);
++    for (struct mru_node *n = mru.head, *next; n; n = next) {
++        next = n->next;
++        if (n->p == p) {
++            unlink(n);
++            kfree((void*)n);
++        }
++    }
++    release(&mru.lock);
++}
++
++int
++mru_evict_one(struct proc **victim_p, uint64 *victim_va)
++{
++    acquire(&mru.lock);
++    for (struct mru_node *n = mru.head; n; n = n->next) {
++        // Defensive: drop bogus entries if any appear
++        if (n->va >= MAXVA) {
++            struct mru_node *bad = n;
++            n = n->next;
++            unlink(bad);
++            kfree((void*)bad);
++            if (!n) break;
++        }
++
++        // Inspect PTE & PA under lock
++        pte_t *pte = walk(n->p->pagetable, n->va, 0);
++        if (!pte || !(*pte & PTE_V) || !(*pte & PTE_U))
++            continue;
++
++        // Leaf only: requires at least one of R/W/X
++        if ((*pte & (PTE_R | PTE_W | PTE_X)) == 0)
++            continue;
++
++        uint64 pa = PTE2PA(*pte);
++
++        // Do not evict shared/COW pages
++        if (getref(pa) > 1)
++            continue;
++
++        // Safety guards
++        if (!(*pte & PTE_U)) panic("evict non-user");
++        if ((*pte & (PTE_R|PTE_W|PTE_X)) == 0) panic("evict non-leaf");
++
++#ifdef MRU_DEBUG
++        uint64 headva = mru.head ? mru.head->va : 0;
++        printf("[evict] pid=%d va=%p head=%p %s\n",
++               n->p->pid, (void*)n->va, (void*)headva,
++               (headva == n->va) ? "OK:MRU" : "MISMATCH");
++#endif
++
++        // Found MRU victim; pop from list now.
++        *victim_p = n->p;
++        *victim_va = n->va;
++
++        unlink(n);
++        kfree((void*)n);
++
++        release(&mru.lock);
++        return 1;
++    }
++    release(&mru.lock);
++    return 0;
++}
++
++void
++mru_dump(void)
++{
++    acquire(&mru.lock);
++    int shown = 0, total = 0;
++    printf("MRU(head->tail): ");
++    for (struct mru_node *n = mru.head; n; n = n->next) {
++        if (shown < MRU_DUMP_MAX) {
++            printf("(%d,%p) ", n->p->pid, (void*)n->va);
++            shown++;
++        }
++        total++;
++    }
++    if (total > MRU_DUMP_MAX)
++        printf("... (+%d more)", total - MRU_DUMP_MAX);
++    printf("\n");
++    release(&mru.lock);
++}
++
++void
++mru_remove(struct proc *p, uint64 va)
++{
++    va = PGROUNDDOWN(va);
++    acquire(&mru.lock);
++    struct mru_node *n = find_aligned_locked(p, va);
++    if (n) {
++        unlink(n);
++        kfree((void*)n);
++    }
++    release(&mru.lock);
++}
+\ No newline at end of file
+diff --git a/kernel/paging.h b/kernel/paging.h
+new file mode 100644
+index 0000000..ea2512c
+--- /dev/null
++++ b/kernel/paging.h
+@@ -0,0 +1,52 @@
++// kernel/paging.h
++#ifndef _PAGING_H_
++#define _PAGING_H_
++
++#include "types.h"
++#include "param.h"
++#include "riscv.h"
++
++// Forward-declare proc so we can use pointers to it in prototypes/structs.
++struct proc;
++
++// ---- Swap bookkeeping ----
++#ifndef MAXSWAP
++#define MAXSWAP 1024
++#endif
++
++struct swapent {
++    uint64 va;  // page-aligned VA
++    int    used; // 0/1
++};
++
++// ---- Per-proc paging stats ----
++struct pagestat {
++    uint64 faults;
++    uint64 swapins;
++    uint64 swapouts;
++};
++
++// ---- MRU node ----
++struct mru_node {
++    struct mru_node *prev;
++    struct mru_node *next;
++    struct proc     *p;
++    uint64          va;  // page-aligned VA
++};
++
++// ---- MRU / swap APIs ----
++void mru_init(void);
++void mru_on_map(struct proc *p, uint64 va);
++void mru_on_unmap(struct proc *p, uint64 va);
++void mru_touch(struct proc *p, uint64 va);
++int  mru_evict_one(struct proc **victim_p, uint64 *victim_va);
++void mru_purge_proc(struct proc *p);
++void mru_dump(void);
++
++int  swap_lookup(struct proc *p, uint64 va, int *slot_out); // -1 if not swapped
++int  swap_out_page(struct proc *p, uint64 va);             // write page to swap
++int  swap_in_page(struct proc *p, uint64 va);              // read page from swap
++void swap_destroy(struct proc *p);
++void swap_forget_va(struct proc *p, uint64 va);            // clear mapping for VA
++
++#endif // _PAGING_H_
+\ No newline at end of file
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22a5401..9ed6ad3 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -146,6 +146,20 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++  // Initialize paging statistics to zero
++  p->pgstat.faults = 0;
++  p->pgstat.swapins = 0;
++  p->pgstat.swapouts = 0;
++
++  // Initialize swap file pointer to null
++  p->swapip = 0;
++
++  // Clear the swapmap array
++  for(int i = 0; i < MAXSWAP; i++){
++    p->swapmap[i].used = 0;
++    p->swapmap[i].va = 0;
++  }
++
+   return p;
+ }
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..2f392c6 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -1,3 +1,5 @@
++#include "paging.h" // Ensure paging.h is included for struct definitions
++
+ // Saved registers for kernel context switches.
+ struct context {
+   uint64 ra;
+@@ -104,4 +106,15 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  // --- New Paging & Swap Metadata ---
++  
++  // Array to track which VAs are in which disk slots
++  struct swapent swapmap[MAXSWAP]; 
++
++  // Inode for the process-specific swap file
++  struct inode *swapip;            
++
++  // Statistics for page faults, swap-ins, and swap-outs
++  struct pagestat pgstat;
+ };
+diff --git a/kernel/swap.c b/kernel/swap.c
+new file mode 100644
+index 0000000..82b5781
+--- /dev/null
++++ b/kernel/swap.c
+@@ -0,0 +1,190 @@
++// kernel/swap.c
++#include "types.h"
++#include "riscv.h"
++#include "defs.h"
++#include "param.h"
++#include "fs.h"
++#include "spinlock.h"
++#include "sleeplock.h"
++#include "file.h"
++#include "proc.h"
++#include "paging.h"
++
++void
++swap_forget_va(struct proc *p, uint64 va)
++{
++    for (int i = 0; i < MAXSWAP; i++) {
++        if (p->swapmap[i].used && p->swapmap[i].va == va) {
++            p->swapmap[i].used = 0;
++            p->swapmap[i].va   = 0;
++            return;
++        }
++    }
++}
++
++static void itoa_dec(int x, char *buf) {
++    char tmp[16];
++    int i = 0;
++    if (x == 0) { buf[0] = '0'; buf[1] = 0; return; }
++    while (x > 0 && i < (int)sizeof(tmp)) {
++        tmp[i++] = '0' + (x % 10);
++        x /= 10;
++    }
++    int j = 0;
++    while (i > 0) buf[j++] = tmp[--i];
++    buf[j] = 0;
++}
++
++static void build_swap_name(char *dst, int pid) {
++    char num[16];
++    itoa_dec(pid, num);
++    char *p = dst;
++    *p++ = '/';
++    *p++ = 's'; *p++ = 'w'; *p++ = 'a'; *p++ = 'p'; *p++ = '.';
++    for (int i = 0; num[i]; i++) *p++ = num[i];
++    *p = 0;
++}
++
++static int
++swap_open(struct proc *p)
++{
++    if (p->swapip)
++        return 0;
++
++    char path[32];
++    build_swap_name(path, p->pid);
++
++    begin_op();
++    struct inode *ip = namei(path);
++    if (ip == 0) {
++        char name[DIRSIZ];
++        struct inode *dp = nameiparent(path, name);
++        if (dp == 0) {
++            end_op();
++            return -1;
++        }
++        ilock(dp);
++        ip = dirlookup(dp, name, 0);
++        if (ip) {
++            iunlockput(dp);
++            ilock(ip);
++            iunlock(ip);
++        } else {
++            ip = ialloc(dp->dev, T_FILE);
++            if (ip == 0) {
++                iunlockput(dp);
++                end_op();
++                return -1;
++            }
++            ilock(ip);
++            ip->major = 0;
++            ip->minor = 0;
++            ip->nlink = 1;
++            iupdate(ip);
++            if (dirlink(dp, name, ip->inum) < 0) {
++                iunlockput(ip);
++                iunlockput(dp);
++                end_op();
++                return -1;
++            }
++            iunlock(ip);
++            iunlockput(dp);
++        }
++    } else {
++        ilock(ip);
++        iunlock(ip);
++    }
++    end_op();
++    p->swapip = ip;
++    return 0;
++}
++
++int
++swap_lookup(struct proc *p, uint64 va, int *slot_out)
++{
++    va = PGROUNDDOWN(va);
++    for (int i = 0; i < MAXSWAP; i++) {
++        if (p->swapmap[i].used && p->swapmap[i].va == va) {
++            if (slot_out) *slot_out = i;
++            return i;
++        }
++    }
++    return -1;
++}
++
++int
++swap_out_page(struct proc *p, uint64 va)
++{
++    if (swap_open(p) < 0) return -1;
++
++    int slot = -1;
++    for (int i = 0; i < MAXSWAP; i++) if (!p->swapmap[i].used) { slot = i; break; }
++    if (slot < 0) return -1;
++
++    va = PGROUNDDOWN(va);
++    pte_t *pte = walk(p->pagetable, va, 0);
++    if (!pte || !(*pte & PTE_V) || !(*pte & PTE_U)) return -1;
++
++    uint64 pa = PTE2PA(*pte);
++
++    begin_op();
++    ilock(p->swapip);
++    int ok = (writei(p->swapip, 0, pa, (uint)slot * PGSIZE, PGSIZE) == PGSIZE);
++    iunlock(p->swapip);
++    end_op();
++    if (!ok) return -1;
++
++    p->swapmap[slot].used = 1;
++    p->swapmap[slot].va   = va;
++
++    uvmunmap(p->pagetable, va, 1, 0);
++    *pte = 0;
++
++    p->pgstat.swapouts++;
++    return 0;
++}
++
++int
++swap_in_page(struct proc *p, uint64 va)
++{
++    if (!p || !p->pagetable) return -1;
++    if (swap_open(p) < 0) return -1;
++
++    int slot;
++    if (swap_lookup(p, PGROUNDDOWN(va), &slot) < 0) return -1;
++
++    char *mem = alloc_page_maybe_evict();
++    if (!mem) return -1;
++
++    begin_op();
++    ilock(p->swapip);
++    int ok = (readi(p->swapip, 0, (uint64)mem, (uint)slot * PGSIZE, PGSIZE) == PGSIZE);
++    iunlock(p->swapip);
++    end_op();
++    if (!ok) { kfree(mem); return -1; }
++
++    if (mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, PTE_U|PTE_R|PTE_W) < 0) {
++        kfree(mem);
++        return -1;
++    }
++
++    p->swapmap[slot].used = 0;
++    p->swapmap[slot].va   = 0;
++
++    p->pgstat.swapins++;
++    mru_on_map(p, va);
++    return 0;
++}
++
++void
++swap_destroy(struct proc *p)
++{
++    if (p->swapip) {
++        iput(p->swapip);
++        p->swapip = 0;
++    }
++    for (int i = 0; i < MAXSWAP; i++) {
++        p->swapmap[i].used = 0;
++        p->swapmap[i].va   = 0;
++    }
++}
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 419e727..d16584b 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -107,3 +107,38 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++// helper function to locate a process by PID
++struct proc*
++findproc(int pid)
++{
++    for(struct proc *p = proc; p < &proc[NPROC]; p++){
++        if(p->pid == pid) return p;
++    }
++    return 0;
++}
++
++// sys_getpagestat: arg0 = pid (0 for current), arg1 = user pointer to struct pagestat
++uint64
++sys_getpagestat(void)
++{
++    int pid; uint64 uaddr;
++    argint(0, &pid);
++    argaddr(1, &uaddr);
++    
++    struct proc *q = findproc(pid);
++    if(!q) return -1;
++    
++    struct pagestat st = q->pgstat; // Ensure the name matches your struct in proc.h
++    if(copyout(myproc()->pagetable, uaddr, (char*)&st, sizeof(st)) < 0)
++        return -1;
++    return 0;
++}
++
++// sys_dumpmru: invokes the kernel-side mru_dump to print list to console
++uint64
++sys_dumpmru(void)
++{
++    mru_dump();
++    return 0;
++}
+\ No newline at end of file
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 28f4248..6adb944 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -198,16 +198,48 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+   if((va % PGSIZE) != 0)
+     panic("uvmunmap: not aligned");
+ 
++  struct proc *cur = myproc(); // may be 0 during early boot  
++
+   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+-    if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
+-      continue;   
+-    if((*pte & PTE_V) == 0)  // has physical page been allocated?
++    pte = walk(pagetable, a, 0);
++
++    if(pte == 0){
++      // No PTE page at all. If freeing, also forget any swap slot.
++      if(do_free && cur && cur->pagetable == pagetable)
++        swap_forget_va(cur, a);
++      // skip
++      continue;
++    }
++
++    if((*pte & PTE_V) == 0){
++      // Not mapped: could be a demand-paged hole or swapped out.
++      if(do_free && cur && cur->pagetable == pagetable){
++        swap_forget_va(cur, a);
++        *pte = 0; // clear any stale non-leaf bits
++      } else {
++        // caller expects strict unmap, but we're demand-paged: ignore
++        // or, if you want to keep strictness when not freeing:
++        // panic("uvmunmap: not mapped");
++      }
+       continue;
++    }
++
++    if(PTE_FLAGS(*pte) == PTE_V)
++      panic("uvmunmap: not a leaf");
++
+     if(do_free){
+       uint64 pa = PTE2PA(*pte);
+-      kfree((void*)pa);
++      kfree((void*)pa); // decref-aware kfree
++      if(cur && cur->pagetable == pagetable)
++        swap_forget_va(cur, a);
+     }
++
++    // remove the mapping
+     *pte = 0;
++
++    // optional: update MRU if this is a user page
++    if(cur && cur->pagetable == pagetable)
++      mru_on_unmap(cur, a);
+   }
+ }
+ 
+@@ -224,7 +256,8 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+ 
+   oldsz = PGROUNDUP(oldsz);
+   for(a = oldsz; a < newsz; a += PGSIZE){
+-    mem = kalloc();
++    // *** key change: allocate with eviction ***
++    mem = alloc_page_maybe_evict();
+     if(mem == 0){
+       uvmdealloc(pagetable, a, oldsz);
+       return 0;
+@@ -235,6 +268,14 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+       uvmdealloc(pagetable, a, oldsz);
+       return 0;
+     }
++
++    // Tell MRU only when this is the current user process' pagetable.
++    // (Avoids touching MRU during early boot / kernel mappings.)
++    struct proc *mp = myproc();
++    if(mp && mp->pagetable == pagetable){
++      mru_on_map(mp, a);
++      mru_touch(mp, a);
++    }
+   }
+   return newsz;
+ }
+@@ -347,20 +388,15 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ 
+   while(len > 0){
+     va0 = PGROUNDDOWN(dstva);
+-    if(va0 >= MAXVA)
+-      return -1;
++
+   
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0) {
+-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+-        return -1;
+-      }
++      return -1;
+     }
+ 
+-    pte = walk(pagetable, va0, 0);
+-    // forbid copyout over read-only user text pages.
+-    if((*pte & PTE_W) == 0)
+-      return -1;
++    // NEW: Record this access in the MRU list
++    mru_touch(myproc(), va0);
+       
+     n = PGSIZE - (dstva - va0);
+     if(n > len)
+@@ -411,10 +447,13 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+ {
+   uint64 n, va0, pa0;
+   int got_null = 0;
++  struct proc *cur = myproc();
+ 
+   while(got_null == 0 && max > 0){
+     va0 = PGROUNDDOWN(srcva);
+     pa0 = walkaddr(pagetable, va0);
++    if(cur && cur->pagetable == pagetable)
++      mru_touch(cur, va0);
+     if(pa0 == 0)
+       return -1;
+     n = PGSIZE - (srcva - va0);
+@@ -484,3 +523,63 @@ ismapped(pagetable_t pagetable, uint64 va)
+   }
+   return 0;
+ }
++
++int
++try_evict_one(void)
++{
++    struct proc *vp = 0;
++    uint64 vva = 0;
++
++    // Pick a victim from the MRU head
++    if (!mru_evict_one(&vp, &vva))
++        return -1;
++
++    // Write it to the per-process swap file
++    if (swap_out_page(vp, vva) < 0)
++        return -1;
++
++    // Cleanup MRU tracking for this VA
++    mru_on_unmap(vp, vva);
++    return 0;
++}
++
++// kalloc wrapper that triggers eviction if memory is full
++char *
++alloc_page_maybe_evict(void)
++{
++    for (;;) {
++        char *m = kalloc();
++        if (m) return m;
++        
++        // If kalloc fails, try to evict one page and retry
++        if (try_evict_one() < 0)
++            return 0; // Out of memory: nothing left to evict
++    }
++}
++
++int
++handle_pf(struct proc *p, uint64 va, int is_write)
++{
++  p->pgstat.faults++;             // count every user page fault
++  va = PGROUNDDOWN(va);
++
++  // 1) swapped?
++  int slot;
++  if (swap_lookup(p, va, &slot) >= 0) {
++    if (swap_in_page(p, va) < 0) return -1;
++    mru_touch(p, va);
++    return 0;
++  }
++
++  // 2) else, fresh anonymous page
++  char *mem = alloc_page_maybe_evict();
++  if (!mem) return -1;
++  memset(mem, 0, PGSIZE);
++  if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, PTE_U|PTE_R|PTE_W) < 0) {
++    kfree(mem);
++    return -1;
++  }
++  mru_on_map(p, va);
++  mru_touch(p, va);
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/mrumem.c b/user/mrumem.c
+new file mode 100644
+index 0000000..6d497c7
+--- /dev/null
++++ b/user/mrumem.c
+@@ -0,0 +1,114 @@
++// user/mrumem.c - direct-touch version (no pipe)
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++static inline int pagesize(void){ return 4096; }
++
++static void show_delta(const char *label,
++                       struct pagestat *prev, struct pagestat *now)
++{
++    int df = (int)(now->faults - prev->faults);
++    int di = (int)(now->swapins - prev->swapins);
++    int do_ = (int)(now->swapouts - prev->swapouts);
++    if (label && *label) printf("%s ", label);
++    printf("+faults=%d +swapins=%d +swapouts=%d\n", df, di, do_);
++    *prev = *now;
++}
++
++int
++main(void)
++{
++    int me = getpid();
++    struct pagestat base = {0,0,0}, cur;
++
++    if (getpagestat(me, &base) < 0) {
++        printf("mrumem: getpagestat failed\n");
++        exit(1);
++    }
++
++    int ps = pagesize();
++    char *baseptr = 0;
++    int total = 0;
++
++    // ---- Phase 1: grow in small steps, fill known pattern, stop once swapouts>0
++    const int step = 64;        // 64 pages = 256 KiB per step; good for -m 8
++    int saw_swapout = 0;
++
++    for (;;) {
++        char *old = sbrk(step * ps);
++        if (old == (char*)-1) { 
++            printf("sbrk failed at total=%d\n", total); 
++            break; 
++        }
++        if (!baseptr) baseptr = old;
++
++        for (int i = 0; i < step; i++) {
++            int j = total + i;
++            volatile char *p = baseptr + (uint64)j * ps;
++            *p = (char)(j & 0xFF);          // write known byte per page
++        }
++        total += step;
++
++        if (getpagestat(me, &cur) == 0) {
++            printf("[grow npages=%d] ", total);
++            show_delta("", &base, &cur);
++            if ((int)cur.swapouts > 0) { 
++                saw_swapout = 1; 
++                break; 
++            }
++        } else {
++            break;
++        }
++    }
++
++    if (!saw_swapout) {
++        printf("note: no swapouts yet - try running with smaller RAM (e.g., -m 8) or keep growing.\n");
++    }
++
++    // ---- Phase 2: force swap-ins by directly touching the *newest* pages
++    // MRU evicts the most-recently-touched (the tail of our growth).
++    // Re-reading those newest pages should fault and swap them back in.
++    int W = 64;
++    if (W > total) W = total;
++    int window_start = total - W;
++
++    struct pagestat thr0;
++    if (getpagestat(me, &thr0) == 0) {
++        int iters = W * 16;             // a few cycles across the window
++        for (int t = 0; t < iters; t++) {
++            int idx = window_start + (t % W);
++            volatile char *p = baseptr + (uint64)idx * ps;
++            char v = *p; (void)v;       // user-mode read -> page fault -> swap-in
++        }
++        if (getpagestat(me, &cur) == 0) {
++            printf("[swap-in window] ");
++            show_delta("", &thr0, &cur); // expect +swapins > 0 here
++        }
++    }
++
++    // ---- Phase 3: verify data survived swap
++    int bad = 0;
++    int stride = 97;
++    if (stride > total) stride = 1;
++    for (int j = 0; j < total; j += stride) {
++        volatile char *p = baseptr + (uint64)j * ps;
++        char got = *p, want = (char)(j & 0xFF);
++        if (got != want) {
++            printf("VERIFY: mismatch at page %d (got %d, want %d)\n",
++                   j, (int)got, (int)want);
++            bad = 1; 
++            break;
++        }
++    }
++    printf("VERIFY: %s\n", bad ? "FAIL" : "OK");
++
++    // Totals + optional snapshot
++    if (getpagestat(me, &cur) == 0) {
++        printf("TOTAL: faults=%d swapins=%d swapouts=%d\n",
++               (int)cur.faults, (int)cur.swapins, (int)cur.swapouts);
++    }
++    dumpmru();
++    printf("mrumem: done\n");
++    exit(0);
++}
+\ No newline at end of file

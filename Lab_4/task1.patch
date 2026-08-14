@@ -1,0 +1,403 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 122d9ca..0cebf8d 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -56,6 +56,9 @@ void            itrunc(struct inode*);
+ void            ireclaim(int);
+ 
+ // kalloc.c
++void            incref(uint64 pa);
++int             decref(uint64 pa);  // returns new refcount
++int             getref(uint64 pa);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
+@@ -151,6 +154,7 @@ void            uartputc_sync(int);
+ int             uartgetc(void);
+ 
+ // vm.c
++int             cow_alloc(pagetable_t pagetable, uint64 va0); // allocate private page for va0
+ void            kvminit(void);
+ void            kvminithart(void);
+ void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 0699e7e..61b7293 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -23,10 +23,65 @@ struct {
+   struct run *freelist;
+ } kmem;
+ 
++// task 4.1
++// ---- Reference counts: one per physical page in [KERNBASE, PHYSTOP) ----
++#define NPAGES     ((PHYSTOP - KERNBASE) / PGSIZE)
++#define PA2IDX(pa) (((uint64)(pa) - KERNBASE) >> PGSHIFT)
++
++struct {
++  struct spinlock lock;
++  // One counter per physical page: index = (pa - KERNBASE) >> 12
++  int refcnt[NPAGES];  // <-- was (PHYSTOP)/PGSIZE
++} pref;
++
++static inline int
++valid_idx(int i){ return i >= 0 && i < NPAGES; }
++// task 4.1
++
++// task 4.1
++// Increment refcount of a PA known to correspond to a full page.
++void
++incref(uint64 pa)
++{
++  int i = PA2IDX(pa);
++  if(!valid_idx(i)) panic("incref: bad pa");
++  acquire(&pref.lock);
++  pref.refcnt[i] += 1;
++  release(&pref.lock);
++}
++
++// Decrement refcount, return new count. If it hits 0, caller may free.
++int
++decref(uint64 pa)
++{
++  int i = PA2IDX(pa);
++  if(!valid_idx(i)) panic("decref: bad pa");
++  acquire(&pref.lock);
++  if(pref.refcnt[i] > 0)
++    pref.refcnt[i] -= 1;
++  int v = pref.refcnt[i];
++  release(&pref.lock);
++  return v;
++}
++
++int
++getref(uint64 pa)
++{
++  int i = PA2IDX(pa);
++  if(!valid_idx(i)) panic("getref: bad pa");
++  acquire(&pref.lock);
++  int v = pref.refcnt[i];
++  release(&pref.lock);
++  return v;
++}
++// task 4.1
++
++
+ void
+ kinit()
+ {
+   initlock(&kmem.lock, "kmem");
++    initlock(&pref.lock, "pref");  // <-- needed before freerange -> kfree -> decref // task 4.1
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
+@@ -51,6 +106,12 @@ kfree(void *pa)
+   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
++  // If this is an init-time free (ref=0), we'll...
++  if(decref((uint64)pa) > 0){
++    return;
++  }
++  // task 4.1  
++
+   // Fill with junk to catch dangling refs.
+   memset(pa, 1, PGSIZE);
+ 
+@@ -78,5 +139,16 @@ kalloc(void)
+ 
+   if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
++
++    if(r){
++  memset((char*)r, 5, PGSIZE); // fill with junk
++  // task 4.1
++  int i = PA2IDX((uint64)r);
++  if(!valid_idx(i)) panic("kalloc: bad pa");
++  acquire(&pref.lock);
++  pref.refcnt[i] = 1;
++  release(&pref.lock); // task 4.1
++  }
++    
+   return (void*)r;
+ }
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index ef3372c..5a5c1dc 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -378,3 +378,6 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ // Sv39, to avoid having to sign-extend virtual addresses
+ // that have the high bit set.
+ #define MAXVA (1L << (9 + 9 + 9 + 12 - 1))
++
++// --- COW software bit (unused by hardware; xv6 keeps bits 5..9 free) ---
++#define PTE_COW (1L << 8) // task 4.1
+\ No newline at end of file
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a41cd69..5084464 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -66,7 +66,16 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
+-  } else if((which_dev = devintr()) != 0){
++  } 
++  else if(r_scause() == 15 /* store/AMO page fault */) {
++    // Copy-on-Write: make the faulting page private & writable.
++    uint64 va = r_stval();
++    uint64 va0 = PGROUNDDOWN(va);
++    if(cow_alloc(p->pagetable, va0) < 0){
++      // Not a COW page or OOM -> kill the process.
++      setkilled(p);
++    }
++  else if((which_dev = devintr()) != 0){
+     // ok
+   } else if((r_scause() == 15 || r_scause() == 13) &&
+             vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 28f4248..3bcb724 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -308,13 +308,24 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+       continue;   // physical page hasn't been allocated
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto err;
++
++    // Child gets same flags, except writable pages become RO|COW.
++    uint child_flags = flags;
++    if(flags & PTE_W)
++      child_flags = (flags & ~PTE_W) | PTE_COW;
++
+     memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
++    if(mappages(new, i, PGSIZE, (uint64)mem, child_flags) != 0){
+       goto err;
+     }
++
++    // Now that child mapping succeeded, bump ref and flip parent if needed.
++    incref(pa);
++    if(flags & PTE_W){
++      *pte = PA2PTE(pa) | child_flags;  // parent RO|COW too
++      sfence_vma();
++    }
++
+   }
+   return 0;
+ 
+@@ -336,6 +347,47 @@ uvmclear(pagetable_t pagetable, uint64 va)
+   *pte &= ~PTE_U;
+ }
+ 
++// task 4.1
++// Allocate a private (writable) copy for VA page va0 in pagetable
++// when it currently maps a COW page.
++// Returns 0 on success, -1 on failure.
++int
++cow_alloc(pagetable_t pagetable, uint64 va0)
++{
++  pte_t *pte = walk(pagetable, va0, 0);
++  if(pte == 0) return -1;
++  if((*pte & PTE_V) == 0) return -1;
++
++  // Only act if it is a user COW mapping.
++  if(((*pte & PTE_U) == 0) || ((*pte & PTE_COW) == 0))
++    return -1;
++
++  uint64 oldpa = PTE2PA(*pte);
++  uint flags = PTE_FLAGS(*pte);
++
++  // If nobody else shares it, just flip W and clear COW.
++  if(getref(oldpa) == 1){
++    *pte = PA2PTE(oldpa) | ((flags | PTE_W) & ~PTE_COW);
++    sfence_vma();
++    return 0;
++  }
++
++  // Shared with others: allocate and copy.
++  char *mem = kalloc();
++  if(mem == 0)
++    return -1;
++  memmove(mem, (char*)oldpa, PGSIZE);
++
++  // Point PTE at the new page, writable, not COW.
++  *pte = PA2PTE((uint64)mem) | ((flags | PTE_W) & ~PTE_COW);
++
++  // Drop our reference to the old shared page.
++  kfree((void*)oldpa);
++
++  sfence_vma();
++  return 0;
++}
++
+ // Copy from kernel to user.
+ // Copy len bytes from src to virtual address dstva in a given page table.
+ // Return 0 on success, -1 on error.
+@@ -344,6 +396,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
+   uint64 n, va0, pa0;
+   pte_t *pte;
++  struct proc *cur = myproc();
+ 
+   while(len > 0){
+     va0 = PGROUNDDOWN(dstva);
+@@ -358,9 +411,58 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+     }
+ 
+     pte = walk(pagetable, va0, 0);
++
++    // If the page is not present, try to make it present:
++    if (pte == 0 || (*pte & PTE_V) == 0) {
++      // Only the current process's address space can be fixed here.
++      if (!(cur && cur->pagetable == pagetable))
++        return -1;
++
++      // Was it swapped out? Swap it back in.
++      int slot;
++      if (swap_lookup(cur, va0, &slot) >= 0) {
++        if (swap_in_page(cur, va0) < 0)
++          return -1;
++        // Re-walk after swap-in
++        pte = walk(pagetable, va0, 0);
++      } else if (va0 < cur->sz) {
++        // Demand-zero allocate within valid size.
++        char *mem = alloc_page_maybe_evict();
++        if (mem == 0)
++          return -1;
++        memset(mem, 0, PGSIZE);
++        if (mappages(pagetable, va0, PGSIZE, (uint64)mem, PTE_U | PTE_R | PTE_W) < 0) {
++          kfree(mem);
++          return -1;
++        }
++        mru_on_map(cur, va0);
++        // Re-walk after mapping
++        pte = walk(pagetable, va0, 0);
++      } else {
++        return -1;
++      }
++    }
++
++    if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
++      return -1;
++
++    // If RO but COW, resolve it first.
++    if (((*pte & PTE_W) == 0) && ((*pte & PTE_COW) != 0)) {
++      if (cow_alloc(pagetable, va0) < 0)
++        return -1;
++      pte = walk(pagetable, va0, 0);
++      if (pte == 0)
++        return -1;
++    }
++
+     // forbid copyout over read-only user text pages.
+     if((*pte & PTE_W) == 0)
+       return -1;
++
++    if (cur && cur->pagetable == pagetable)
++      mru_touch(cur, va0);
++      
++    pa0 = PTE2PA(*pte);  
+       
+     n = PGSIZE - (dstva - va0);
+     if(n > len)
+@@ -369,7 +471,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ 
+     len -= n;
+     src += n;
+-    dstva = va0 + PGSIZE;
++    dstva += n;
+   }
+   return 0;
+ }
+@@ -402,6 +504,8 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+   return 0;
+ }
+ 
++
++
+ // Copy a null-terminated string from user to kernel.
+ // Copy bytes to dst from virtual address srcva in a given page table,
+ // until a '\0', or max.
+@@ -484,3 +588,5 @@ ismapped(pagetable_t pagetable, uint64 va)
+   }
+   return 0;
+ }
++
++
+diff --git a/user/cowtest.c b/user/cowtest.c
+new file mode 100644
+index 0000000..1330920
+--- /dev/null
++++ b/user/cowtest.c
+@@ -0,0 +1,68 @@
++// user/cowtest.c
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++static void print_state(const char *tag, void *p) {
++  uint64 pa = v2p(p);
++  int rc = pgref(p);
++  printf("%s: va=%p pa=%p ref=%d\n", tag, p, (void*)pa, rc);
++}
++
++int
++main(void)
++{
++  // Allocate one page and align pointer to page start.
++  char *p = sbrk(4096);
++  if(p == (char*)-1){
++    printf("cowtest: sbrk failed\n");
++    exit(1);
++  }
++  p = (char*)(((uint64)p + 4095) & ~((uint64)4095));
++
++  // Touch it so the page exists and is writable pre-fork.
++  *p = 0x2A; // 42
++
++  int pid = fork();
++  if(pid < 0){
++    printf("cowtest: fork failed\n");
++    exit(1);
++  }
++
++  if(pid == 0){
++    // Child
++    print_state("child: before write", p);
++
++    // First write triggers COW in child.
++    *p = 0x7B; // 123
++
++    print_state("child: after write", p);
++    // Sanity: child's value must be 123 now.
++    if(*p != 0x7B){
++      printf("cowtest: child write failed (%d)\n", *p);
++      exit(1);
++    }
++    exit(0);
++  } else {
++    // Parent
++    // Small delay so child likely prints its "before write" first.
++    sleep(5);
++    print_state("parent: post-fork", p);
++
++    // Wait for child to do COW work.
++    wait(0);
++
++    // After child COWs, parent should still point to original PA,
++    // and refcount should now be 1 (child moved to a new page).
++    print_state("parent: after wait", p);
++
++    // Parent sees original value.
++    if(*p != 0x2A){
++      printf("cowtest: parent saw corrupted value (%d)\n", *p);
++      exit(1);
++    }
++
++    printf("cowtest: OK\n");
++    exit(0);
++  }
++}
+\ No newline at end of file
